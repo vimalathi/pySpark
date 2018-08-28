@@ -51,6 +51,3 @@ The following equation is used in Logistic Regression:
 
 log [p/1-p]= Bo + B(Age)	//B-beta, o in subscript
 
-Read this article to know more about Logistic Regression.
-
-Note: If you are interested in trying out other machine learning algorithms like RandomForest, Support Vector Machine, or XGBoost, there is a full-fledged course on Sentiment Analysis coming up shortly for you at https://trainings.analyticsvidhya.com.
