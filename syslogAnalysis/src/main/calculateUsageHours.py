@@ -55,7 +55,9 @@ openedAndClosedSessionUnion = openedAndClosedSession.union(openedAndClosedSessio
 openedClosedSessionKeyValue = openedAndClosedSessionUnion.map(lambda ocskv: (ocskv[0], str(ocskv[1]).split(" ")[2]))
 timeFormat = "%H:%M:%S"
 sessionUsageInHoursBykey = openedClosedSessionKeyValue.reduceByKey(lambda stu1, stu2: timeDifference(stu1, stu2))
-sessionUsageInHoursBykey.collect()  # 5014
+sessionUsageInHoursBykey.persist()
+sessionUsageInHoursBykey.collect() # 5014
+
 # openedSessionFilter = openedClosedFilterDistinct.filter(lambda osf: str(osf.split(" ")[7]).lower() == "opened")  # 4830
 # closedSessionFilter = openedClosedFilterDistinct.filter(
 #     lambda csf: str(csf.split(" ")[7]).lower() == "closed")  # 4774 #56 diff
