@@ -1,5 +1,5 @@
 from pyspark import SparkContext, SparkConf
-from datetime import datetime
+from datetime import datetime, timedelta, date
 import sys;
 
 # if len(sys.argv) != 3:
@@ -19,6 +19,7 @@ conf = SparkConf().setAppName("transformation").setMaster("local[2]")
 sc = SparkContext(conf=conf)
 
 
+# returns time difference between session start and end time in seconds
 def timeDifference(x, y):
     timeformat = "%H:%M:%S"
     # if x == "":
@@ -29,12 +30,46 @@ def timeDifference(x, y):
     b = datetime.strptime(y, timeformat)
     if a > b:
         secs = (a - b).total_seconds()
-        return (secs / 61) / 60
+        return secs
     else:
         secs = (b - a).total_seconds()
-        return (secs / 61) / 60
+        return secs
 
 
+months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]  # .index()
+# monInNumber = input()
+monInNumber = 7
+dayOfMonth = 29
+weekInNumber = 30
+
+
+# this will extract the dates in the given week
+def extract_dates(year, week):
+    dates = []
+    dt = date(year, 1, 1)
+    if dt.weekday() > 3:
+        dt = dt + timedelta(7 - dt.weekday())
+    else:
+        dt = dt - timedelta(dt.weekday())
+    dlt = timedelta(days=(week - 1) * 7)
+    for i in range(0, 7):
+        Date = dt + dlt + timedelta(days=i)
+        dates.append(str(Date))
+    return dates
+
+
+fulldateList = extract_dates(2018, 30)  # 30th week of the year 2018
+# extracting date and month into separate list
+dateList = []
+monthList = []
+for i in range(0, len(fulldateList)):
+    dateList.append(fulldateList[i][8:])
+    x = int(fulldateList[i][5:7])
+    if months[x - 1] not in monthList:
+        monthList.append(months[x - 1])
+
+# --------------------------------------------------------------------------------------------------------------------
+# unique session usage in seconds common key wise (key => "Jul 10 gw02 sshd[15273]: pramodluffy")
 secureLog = sc.textFile("c:\\data\\secureMixed2.log").persist()  # count - 1166245
 # to filter ssh session logs
 sshdFilter = secureLog.filter(lambda sf: (str(sf.split(" ")[4])[:4]).lower() == "sshd")
@@ -54,10 +89,65 @@ openedAndClosedSession2 = closedSession.filter(lambda oacs: oacs[0] in openedSes
 openedAndClosedSessionUnion = openedAndClosedSession.union(openedAndClosedSession2)  # 9176
 openedClosedSessionKeyValue = openedAndClosedSessionUnion.map(lambda ocskv: (ocskv[0], str(ocskv[1]).split(" ")[2]))
 timeFormat = "%H:%M:%S"
-sessionUsageInHoursBykey = openedClosedSessionKeyValue.reduceByKey(lambda stu1, stu2: timeDifference(stu1, stu2))
-sessionUsageInHoursBykey.persist()
-sessionUsageInHoursBykey.collect() # 5014
+sessionUsageInSecondsBykey = openedClosedSessionKeyValue.reduceByKey(lambda stu1, stu2: timeDifference(stu1, stu2))
+sessionUsageInSecondsBykey.persist()
+# unique session usage in seconds
+sessionUsageInSecondsBykey.collect()  # 4588
+# --------------------------------------------------------------------------------------------------------------------
+# average time per session per day
+# extracting Month and date as key and calculated time as value
+sessionUsageInSecondsDayByMap = sessionUsageInSecondsBykey.map(
+    lambda oacsudbym: (oacsudbym[0].split(" ")[0] + " " + oacsudbym[0].split(" ")[1], oacsudbym[1]))
+# aggigating useage time by date and count by date
+sessionUsageTotalInSecondsByDay = sessionUsageInSecondsDayByMap.aggregateByKey((0.0, 0), (
+    lambda totalTimeAndCount, element: (totalTimeAndCount[0] + element, totalTimeAndCount[1] + 1)),
+                                                                               (lambda finalTotalTimeAndCount,
+                                                                                       interTotalTimeAndCount: (
+                                                                                   finalTotalTimeAndCount[0] +
+                                                                                   interTotalTimeAndCount[0],
+                                                                                   finalTotalTimeAndCount[1] +
+                                                                                   interTotalTimeAndCount[1])))  # 22
+# average time per session per day wise
+averageUsagePerSessionPerDay = sessionUsageTotalInSecondsByDay.map(
+    lambda aupspd: (aupspd[0], aupspd[1][0] / aupspd[1][1]))
+# --------------------------------------------------------------------------------------------------------------------
+# average time per session per month
+# filtering records for the required month
+sessionUsageInSecondsMonthFilter = sessionUsageInSecondsDayByMap.filter(
+    lambda suismf: suismf[0].split(" ")[0] in months[monInNumber - 1])
+sessionUsageInSecondsMonthByMap = sessionUsageInSecondsMonthFilter.map(
+    lambda suismbm: (suismbm[0].split(" ")[0], suismbm[1]))
+sessionUsageTotalInSecondsByMonth = sessionUsageInSecondsMonthByMap.aggregateByKey((0.0, 0), (
+    lambda totalTimeAndCount, element: (totalTimeAndCount[0] + element, totalTimeAndCount[1] + 1)),
+                                                                                   (lambda finalTotalTimeAndCount,
+                                                                                           interTotalTimeAndCount: (
+                                                                                       finalTotalTimeAndCount[0] +
+                                                                                       interTotalTimeAndCount[0],
+                                                                                       finalTotalTimeAndCount[1] +
+                                                                                       interTotalTimeAndCount[1])))
+# average time per session per month
+averageUsagePerSessionPerMonth = sessionUsageTotalInSecondsByMonth.map(
+    lambda aupspm: (aupspm[0], aupspm[1][0] / aupspm[1][1]))
+# --------------------------------------------------------------------------------------------------------------------
+# average time per session per week
+sessionUsageInSecondsWeekFilter = sessionUsageInSecondsBykey.filter(
+    lambda suiswf: suiswf[0].split(" ")[0] in monthList and suiswf[0].split(" ")[1] in dateList)  # 1484
+sessionUsageInSecondsByWeekMap = sessionUsageInSecondsWeekFilter.map(
+    lambda suisbwm: ("week" + str(weekInNumber), suisbwm[1]))
+sessionUsageTotalInSecondsByWeek = sessionUsageInSecondsByWeekMap.aggregateByKey((0.0, 0), (
+    lambda totalTimeAndCount, element: (totalTimeAndCount[0] + element, totalTimeAndCount[1] + 1)),
+                                                                                 (lambda finalTotalTimeAndCount,
+                                                                                         interTotalTimeAndCount: (
+                                                                                     finalTotalTimeAndCount[0] +
+                                                                                     interTotalTimeAndCount[0],
+                                                                                     finalTotalTimeAndCount[1] +
+                                                                                     interTotalTimeAndCount[1])))
 
+# average time per session per week in seconds
+averageUsagePerSessionPerWeek = sessionUsageTotalInSecondsByWeek.map(
+    lambda aupspw: (aupspw[0], aupspw[1][0] / aupspw[1][1]))
+
+# --------------------------------------------------------------------------------------------------------------------
 # openedSessionFilter = openedClosedFilterDistinct.filter(lambda osf: str(osf.split(" ")[7]).lower() == "opened")  # 4830
 # closedSessionFilter = openedClosedFilterDistinct.filter(
 #     lambda csf: str(csf.split(" ")[7]).lower() == "closed")  # 4774 #56 diff
