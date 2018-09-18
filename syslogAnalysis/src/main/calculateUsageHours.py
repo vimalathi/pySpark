@@ -1,26 +1,64 @@
 from pyspark import SparkContext, SparkConf
 from datetime import datetime, timedelta, date
-import sys;
+from pyspark import SQLContext, Row
+import sys
+import os
+from pyelasticsearch import ElasticSearch
 
-# if len(sys.argv) != 3:
-#     print ("<runLocal> <inputPath> <outputPath>")
-#     sys.exit(0)
-#
-# if str(sys.argv[0]).lower() == "runlocal":
-#     conf = SparkConf().setAppName("transformation").setMaster("local[2]")
-#     conf.set("spark.broadcast.compress", "false")
-#     conf.set("spark.shuffle.compress", "false")
-#     conf.set("spark.shuffle.spill.compress", "false")
-#     sc = SparkContext(conf=conf)
-# else:
-#     conf = SparkConf().setAppName("logAnalysis")
-#     sc = SparkContext(conf=conf)
-conf = SparkConf().setAppName("transformation").setMaster("local[2]")
-sc = SparkContext(conf=conf)
+CHUNKSIZE = 100
+
+# set environment variable PYSPARK_SUBMIT_ARGS
+os.environ['PYSPARK_SUBMIT_ARGS'] = '-- jars c:\\data\\elasticsearch-spark-13_2.10-5.3.2.jar pyspark-shell'
+
+# es_write_conf = {
+#     "es.nodes": 'localhost',
+#     "es.port": '9200',
+#     # specify a resource in the form 'index/doc-type'
+#     # "es.resource": 'syslog_analysis_pyspark/ssh_logs',
+#     # "es.input.json": "yes",
+#     # is there a field in the mapping that should be used to specify the ES document ID
+#     "es.mapping.id": "userKey",
+#     "es.query": "match_all"
+# }
+
+if len(sys.argv) != 1:
+    print ("usage: <runLocal>")
+    sys.exit(0)
+
+if str(sys.argv[0]) == "runLocal":
+    conf = SparkConf().setAppName("logAnalysisPysparkj").setMaster("local[2]")
+    conf.set("spark.broadcast.compress", "false")
+    conf.set("spark.shuffle.compress", "false")
+    conf.set("spark.shuffle.spill.compress", "false")
+    sc = SparkContext(conf=conf)
+else:
+    conf = SparkConf().setAppName("logAnalysisPyspark")
+    sc = SparkContext(conf=conf)
+# conf = SparkConf().setAppName("transformation").setMaster("local[2]")
+# conf = es_write_conf
+# sc = SparkContext(conf=conf)
+sqlc = SQLContext(sc)
+
+
+# es = ElasticSearch(urls='http://localhost', port=9200)
+
+
+def index_data(data_source, index_name, doc_type):
+    es = ElasticSearch(urls='http://localhost', port=9200)
+    try:
+        es.delete_index(index_name)
+    except:
+        pass
+    es.create_index(index_name)
+    try:
+        es.bulk_index(index_name, doc_type, data_source)
+    except:
+        print("Error! Skipping Document...!")
+        pass
 
 
 # returns time difference between session start and end time in seconds
-def timeDifference(x, y):
+def time_difference(x, y):
     timeformat = "%H:%M:%S"
     # if x == "":
     #     x = str(datetime.now().strftime(timeformat))
@@ -70,6 +108,7 @@ for i in range(0, len(fulldateList)):
 
 # --------------------------------------------------------------------------------------------------------------------
 # unique session usage in seconds common key wise (key => "Jul 10 gw02 sshd[15273]: pramodluffy")
+sc.setLogLevel("ERROR")
 secureLog = sc.textFile("c:\\data\\secureMixed2.log").persist()  # count - 1166245
 # to filter ssh session logs
 sshdFilter = secureLog.filter(lambda sf: (str(sf.split(" ")[4])[:4]).lower() == "sshd")
@@ -89,24 +128,47 @@ openedAndClosedSession2 = closedSession.filter(lambda oacs: oacs[0] in openedSes
 openedAndClosedSessionUnion = openedAndClosedSession.union(openedAndClosedSession2)  # 9176
 openedClosedSessionKeyValue = openedAndClosedSessionUnion.map(lambda ocskv: (ocskv[0], str(ocskv[1]).split(" ")[2]))
 timeFormat = "%H:%M:%S"
-sessionUsageInSecondsBykey = openedClosedSessionKeyValue.reduceByKey(lambda stu1, stu2: timeDifference(stu1, stu2))
+sessionUsageInSecondsBykey = openedClosedSessionKeyValue.reduceByKey(lambda stu1, stu2: time_difference(stu1, stu2))
 sessionUsageInSecondsBykey.persist()
 # unique session usage in seconds
 sessionUsageInSecondsBykey.collect()  # 4588
+sessionUsageInSecondsRow = sessionUsageInSecondsBykey.map(
+    lambda suisr: Row(user_key=suisr[0], usage_in_seconds=int(suisr[1])))
+sessionUsageInSecondsDF = sqlc.createDataFrame(sessionUsageInSecondsRow)
+sessionUsageInSecondsDF.registerTempTable("total_session_usage_table")
+# sessionUsageInSecondsDF.show()
+# sqlc.sql("select * from total_session_usage_table").saveToEs("syslog_analysis_pyspark/total_usage")
+sessionUsageInSecondsBykeyES = sessionUsageInSecondsBykey.map(
+    lambda (a, b): {'user_key': a, 'usage_in_seconds': b})  # we can add id here also
+documents = sessionUsageInSecondsBykeyES.collect()
+# es.bulk_index(index="syslog_analysis_scala", doc_type="total_usage", docs=documents, id_field='id',
+#               parent_field='_parent', index_field='_index', type_field='_type')
+# es.bulk(documents, index='syslog_analysis_scala', doc_type='total_usage')
+index_data(documents, 'syslog_analysis_pyspark', 'total_usage')
+
+# sessionUsageInSecondsBykeyES.saveAsNewAPIHadoopFile(
+#     path='-',
+#     outputFormatClass="org.elasticsearch.hadoop.mr.EsOutputFormat",
+#     keyClass="org.apache.hadoop.io.NullWritable",
+#     valueClass="org.elasticsearch.hadoop.mr.LinkedMapWritable", conf=es_write_conf)
+
+# df = sessionUsageInSecondsDF.drop('_id')
+# df.write.format("org.elasticsearch.spark.sql"). \
+#     option("es.resource", '%s/%s' % (conf['index'], conf['doc_type'])). \
+#     option("es.nodes", conf['host']).option("es.port", conf['port']).save()
 # --------------------------------------------------------------------------------------------------------------------
+# 1. Average time per session per day, week, month
 # average time per session per day
 # extracting Month and date as key and calculated time as value
 sessionUsageInSecondsDayByMap = sessionUsageInSecondsBykey.map(
     lambda oacsudbym: (oacsudbym[0].split(" ")[0] + " " + oacsudbym[0].split(" ")[1], oacsudbym[1]))
 # aggigating useage time by date and count by date
 sessionUsageTotalInSecondsByDay = sessionUsageInSecondsDayByMap.aggregateByKey((0.0, 0), (
-    lambda totalTimeAndCount, element: (totalTimeAndCount[0] + element, totalTimeAndCount[1] + 1)),
-                                                                               (lambda finalTotalTimeAndCount,
-                                                                                       interTotalTimeAndCount: (
-                                                                                   finalTotalTimeAndCount[0] +
-                                                                                   interTotalTimeAndCount[0],
-                                                                                   finalTotalTimeAndCount[1] +
-                                                                                   interTotalTimeAndCount[1])))  # 22
+    lambda totalTimeAndCount, element:
+    (totalTimeAndCount[0] + element, totalTimeAndCount[1] + 1)), (lambda finalTotalTimeAndCount,
+                                                                         interTotalTimeAndCount: (
+    finalTotalTimeAndCount[0] + interTotalTimeAndCount[0],
+    finalTotalTimeAndCount[1] + interTotalTimeAndCount[1])))  # 22
 # average time per session per day wise
 averageUsagePerSessionPerDay = sessionUsageTotalInSecondsByDay.map(
     lambda aupspd: (aupspd[0], aupspd[1][0] / aupspd[1][1]))
@@ -118,13 +180,10 @@ sessionUsageInSecondsMonthFilter = sessionUsageInSecondsDayByMap.filter(
 sessionUsageInSecondsMonthByMap = sessionUsageInSecondsMonthFilter.map(
     lambda suismbm: (suismbm[0].split(" ")[0], suismbm[1]))
 sessionUsageTotalInSecondsByMonth = sessionUsageInSecondsMonthByMap.aggregateByKey((0.0, 0), (
-    lambda totalTimeAndCount, element: (totalTimeAndCount[0] + element, totalTimeAndCount[1] + 1)),
-                                                                                   (lambda finalTotalTimeAndCount,
-                                                                                           interTotalTimeAndCount: (
-                                                                                       finalTotalTimeAndCount[0] +
-                                                                                       interTotalTimeAndCount[0],
-                                                                                       finalTotalTimeAndCount[1] +
-                                                                                       interTotalTimeAndCount[1])))
+    lambda totalTimeAndCount, element:
+    (totalTimeAndCount[0] + element, totalTimeAndCount[1] + 1)), (lambda finalTotalTimeAndCount,
+                                                                         interTotalTimeAndCount: (
+    finalTotalTimeAndCount[0] + interTotalTimeAndCount[0], finalTotalTimeAndCount[1] + interTotalTimeAndCount[1])))
 # average time per session per month
 averageUsagePerSessionPerMonth = sessionUsageTotalInSecondsByMonth.map(
     lambda aupspm: (aupspm[0], aupspm[1][0] / aupspm[1][1]))
@@ -135,19 +194,53 @@ sessionUsageInSecondsWeekFilter = sessionUsageInSecondsBykey.filter(
 sessionUsageInSecondsByWeekMap = sessionUsageInSecondsWeekFilter.map(
     lambda suisbwm: ("week" + str(weekInNumber), suisbwm[1]))
 sessionUsageTotalInSecondsByWeek = sessionUsageInSecondsByWeekMap.aggregateByKey((0.0, 0), (
-    lambda totalTimeAndCount, element: (totalTimeAndCount[0] + element, totalTimeAndCount[1] + 1)),
-                                                                                 (lambda finalTotalTimeAndCount,
-                                                                                         interTotalTimeAndCount: (
-                                                                                     finalTotalTimeAndCount[0] +
-                                                                                     interTotalTimeAndCount[0],
-                                                                                     finalTotalTimeAndCount[1] +
-                                                                                     interTotalTimeAndCount[1])))
-
+    lambda totalTimeAndCount, element:
+    (totalTimeAndCount[0] + element, totalTimeAndCount[1] + 1)), (lambda finalTotalTimeAndCount,
+                                                                         interTotalTimeAndCount: (
+    finalTotalTimeAndCount[0] + interTotalTimeAndCount[0], finalTotalTimeAndCount[1] + interTotalTimeAndCount[1])))
 # average time per session per week in seconds
 averageUsagePerSessionPerWeek = sessionUsageTotalInSecondsByWeek.map(
     lambda aupspw: (aupspw[0], aupspw[1][0] / aupspw[1][1]))
-
 # --------------------------------------------------------------------------------------------------------------------
+# 3. Average time spent on lab per user in a day, week, month
+sessionUsageInSecondsPerUserByDayMap = sessionUsageInSecondsBykey.map(
+    lambda suisubdm: (suisubdm[0].split(" ")[0] + " " + suisubdm[0].split(" ")[1] + " " + suisubdm[0].split(" ")[4],
+                      suisubdm[1]))
+sessionUsageTotalInSecondsPerUserByDay = sessionUsageInSecondsPerUserByDayMap.aggregateByKey((0.0, 0), (
+    lambda totalTimeAndCount, element:
+    (totalTimeAndCount[0] + element, totalTimeAndCount[1] + 1)), (lambda finalTotalTimeAndCount,
+                                                                         interTotalTimeAndCount: (
+    finalTotalTimeAndCount[0] + interTotalTimeAndCount[0], finalTotalTimeAndCount[1] + interTotalTimeAndCount[1])))
+# Average time spent on lab per user in a day
+averageTimeSpentPerUserByDayWise = sessionUsageTotalInSecondsPerUserByDay.map(
+    lambda atspubdw: (atspubdw[0], atspubdw[1][0] / atspubdw[1][1]))
+# --------------------------------------------------------------------------------------------------------------------
+# Average time spent on lab per user in a month
+sessionUsageInSecondsPerUserByMonthMap = sessionUsageInSecondsBykey.map(
+    lambda suispubmm: (suispubmm[0].split(" ")[0] + " " + suispubmm[0].split(" ")[4], suispubmm[1]))
+sessionUsageTotalInSecondsPerUserByMonth = sessionUsageInSecondsPerUserByMonthMap.aggregateByKey((0.0, 0), (
+    lambda totalTimeAndCount, element:
+    (totalTimeAndCount[0] + element, totalTimeAndCount[1] + 1)), (lambda finalTotalTimeAndCount,
+                                                                         interTotalTimeAndCount: (
+    finalTotalTimeAndCount[0] + interTotalTimeAndCount[0], finalTotalTimeAndCount[1] + interTotalTimeAndCount[1])))
+# Average time spent on lab per user in a month
+averageTimeSpentPerUserByMonthWise = sessionUsageTotalInSecondsPerUserByMonth.map(
+    lambda atspubmw: (atspubmw[0], atspubmw[1][0] / atspubmw[1][1]))
+# --------------------------------------------------------------------------------------------------------------------
+# Average time spent on lab per user in a week
+sessionUsageInSecondsPerUserByWeekFilter = sessionUsageInSecondsBykey.filter(
+    lambda suispubwf: suispubwf[0].split(" ")[0] in monthList and suispubwf[0].split(" ")[1] in dateList)
+sessionUsageInSecondsPerUserByWeekMap = sessionUsageInSecondsPerUserByWeekFilter.map(
+    lambda suispubwm: ("week" + str(weekInNumber) + " " + suispubwm[0].split(" ")[4], suispubwm[1]))
+sessionUsageTotalInSecondsPerUserByWeek = sessionUsageInSecondsPerUserByWeekMap.aggregateByKey((0.0, 0), (
+    lambda totalTimeAndCount, element:
+    (totalTimeAndCount[0] + element, totalTimeAndCount[1] + 1)), (lambda finalTotalTimeAndCount,
+                                                                         interTotalTimeAndCount: (
+    finalTotalTimeAndCount[0] + interTotalTimeAndCount[0], finalTotalTimeAndCount[1] + interTotalTimeAndCount[1])))
+averageTimeSpentPerUserByWeek = sessionUsageTotalInSecondsPerUserByWeek.map(
+    lambda atspubw: (atspubw[0], atspubw[1][0] / atspubw[1][1]))
+# --------------------------------------------------------------------------------------------------------------------
+
 # openedSessionFilter = openedClosedFilterDistinct.filter(lambda osf: str(osf.split(" ")[7]).lower() == "opened")  # 4830
 # closedSessionFilter = openedClosedFilterDistinct.filter(
 #     lambda csf: str(csf.split(" ")[7]).lower() == "closed")  # 4774 #56 diff
