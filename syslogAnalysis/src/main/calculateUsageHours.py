@@ -7,7 +7,7 @@ from pyelasticsearch import ElasticSearch
 
 CHUNKSIZE = 100
 
-# set environment variable PYSPARK_SUBMIT_ARGS
+# setting up environment variable PYSPARK_SUBMIT_ARGS
 os.environ['PYSPARK_SUBMIT_ARGS'] = '-- jars c:\\data\\elasticsearch-spark-13_2.10-5.3.2.jar pyspark-shell'
 
 # es_write_conf = {
@@ -25,6 +25,7 @@ if len(sys.argv) != 1:
     print ("usage: <runLocal>")
     sys.exit(0)
 
+# spark context configurations
 if str(sys.argv[0]) == "runLocal":
     conf = SparkConf().setAppName("logAnalysisPysparkj").setMaster("local[2]")
     conf.set("spark.broadcast.compress", "false")
@@ -42,7 +43,8 @@ sqlc = SQLContext(sc)
 
 # es = ElasticSearch(urls='http://localhost', port=9200)
 
-
+# method to write final output to elastic search
+# this will delete and create new index if already exists and loads data to it
 def index_data(data_source, index_name, doc_type):
     es = ElasticSearch(urls='http://localhost', port=9200)
     try:
@@ -57,7 +59,7 @@ def index_data(data_source, index_name, doc_type):
         pass
 
 
-# returns time difference between session start and end time in seconds
+# returns time difference between start and end time in seconds
 def time_difference(x, y):
     timeformat = "%H:%M:%S"
     # if x == "":
@@ -76,6 +78,7 @@ def time_difference(x, y):
 
 months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]  # .index()
 # monInNumber = input()
+# hardcoded input for testing
 monInNumber = 7
 dayOfMonth = 29
 weekInNumber = 30
@@ -95,9 +98,10 @@ def extract_dates(year, week):
         dates.append(str(Date))
     return dates
 
-
-fulldateList = extract_dates(2018, 30)  # 30th week of the year 2018
-# extracting date and month into separate list
+# extracting dates for 30th week of year 2018
+fulldateList = extract_dates(2018, 30)
+# extracting day of month and month into separate list
+# (a week can have days from end of one month and beginning of another month)
 dateList = []
 monthList = []
 for i in range(0, len(fulldateList)):
@@ -109,41 +113,57 @@ for i in range(0, len(fulldateList)):
 # --------------------------------------------------------------------------------------------------------------------
 # unique session usage in seconds common key wise (key => "Jul 10 gw02 sshd[15273]: pramodluffy")
 sc.setLogLevel("ERROR")
-secureLog = sc.textFile("c:\\data\\secureMixed2.log").persist()  # count - 1166245
-# to filter ssh session logs
+secureLog = sc.textFile("c:\\data\\secureMixed.log").persist()  # count - 1166245
+# filtering ssh session logs
 sshdFilter = secureLog.filter(lambda sf: (str(sf.split(" ")[4])[:4]).lower() == "sshd")
+# filtering successful session logs
 openedClosedFilter = sshdFilter.filter(lambda ocf: str(ocf.split(" ")[7]).lower() in ["opened", "closed"])  # 9735
 openedClosedFilterDistinct = openedClosedFilter.distinct()  # 9602
+# mapping the logs with the key combination of => "Jul 10 gw02 sshd[15273]: pramodluffy"
 openedClosedMap = openedClosedFilterDistinct.map(lambda csm: (
     str(csm.split(" ")[0]) + " " + str(csm.split(" ")[1]) + " " + str(csm.split(" ")[3]) + " " + str(
-        csm.split(" ")[4]) + " " + csm.split(" ")[10], csm))  # total 9602 #dist kval 9602 #dist keys 5014
+        csm.split(" ")[4]) + " " + csm.split(" ")[10], csm)).checkpoint()  # total 9602 #dist kval 9602 #dist keys 5014
+# filtering logs for the sessions which are opened and closed
 openedSession = openedClosedMap.filter(
     lambda os: str((os[1]).split(" ")[7]).lower() == "opened")  # count 4829 #dist keys 4829
 closedSession = openedClosedMap.filter(
     lambda cs: str((cs[1]).split(" ")[7]).lower() == "closed")  # total, dist keys 4773 #diff 56
-closedSessionKeys = closedSession.keys().collect()
-openedSessionKeys = openedSession.keys().collect()
-openedAndClosedSession = openedSession.filter(lambda oacs: oacs[0] in closedSessionKeys)  # 4588
-openedAndClosedSession2 = closedSession.filter(lambda oacs: oacs[0] in openedSessionKeys)  # 4588
+# extracting logs matches keys in both openedSession and closedSession rdd
+openedClosedSessionIntersectionKeys = openedSession.keys().intersection(closedSession.keys()).collect()
+openedAndClosedSession = openedSession.filter(lambda oacs: oacs[0] in openedClosedSessionIntersectionKeys)  # 4588
+openedAndClosedSession2 = closedSession.filter(lambda oacs: oacs[0] in openedClosedSessionIntersectionKeys)  # 4588
+# closedSessionKeys = closedSession.keys().collect()
+# openedSessionKeys = openedSession.keys().collect()
+# openedAndClosedSession = openedSession.filter(lambda oacs: oacs[0] in closedSessionKeys)  # 4588
+# openedAndClosedSession2 = closedSession.filter(lambda oacs: oacs[0] in openedSessionKeys)  # 4588
 openedAndClosedSessionUnion = openedAndClosedSession.union(openedAndClosedSession2)  # 9176
+# mapping key with value as time
+# timeFormat = "%H:%M:%S"
 openedClosedSessionKeyValue = openedAndClosedSessionUnion.map(lambda ocskv: (ocskv[0], str(ocskv[1]).split(" ")[2]))
-timeFormat = "%H:%M:%S"
+# calculating time difference between two different time by calling time_difference method
 sessionUsageInSecondsBykey = openedClosedSessionKeyValue.reduceByKey(lambda stu1, stu2: time_difference(stu1, stu2))
 sessionUsageInSecondsBykey.persist()
 # unique session usage in seconds
-sessionUsageInSecondsBykey.collect()  # 4588
-sessionUsageInSecondsRow = sessionUsageInSecondsBykey.map(
-    lambda suisr: Row(user_key=suisr[0], usage_in_seconds=int(suisr[1])))
-sessionUsageInSecondsDF = sqlc.createDataFrame(sessionUsageInSecondsRow)
-sessionUsageInSecondsDF.registerTempTable("total_session_usage_table")
+# sessionUsageInSecondsBykey.collect()  # 4588
+
+# ------ writing to elastic search using data frame and temp table technique -----
+# preparing data frame and registering as temporary table from the previous resulting rdd
+# sessionUsageInSecondsRow = sessionUsageInSecondsBykey.map(
+#     lambda suisr: Row(user_key=suisr[0], usage_in_seconds=int(suisr[1])))
+# sessionUsageInSecondsDF = sqlc.createDataFrame(sessionUsageInSecondsRow)
+# sessionUsageInSecondsDF.registerTempTable("total_session_usage_table")
 # sessionUsageInSecondsDF.show()
 # sqlc.sql("select * from total_session_usage_table").saveToEs("syslog_analysis_pyspark/total_usage")
+
+# ------ writing to elastic search using json document from rdd technique -----
+# preparing json document from the resultant rdd
 sessionUsageInSecondsBykeyES = sessionUsageInSecondsBykey.map(
     lambda (a, b): {'user_key': a, 'usage_in_seconds': b})  # we can add id here also
 documents = sessionUsageInSecondsBykeyES.collect()
 # es.bulk_index(index="syslog_analysis_scala", doc_type="total_usage", docs=documents, id_field='id',
 #               parent_field='_parent', index_field='_index', type_field='_type')
 # es.bulk(documents, index='syslog_analysis_scala', doc_type='total_usage')
+# indexing data to elastic search using custom method
 index_data(documents, 'syslog_analysis_pyspark', 'total_usage')
 
 # sessionUsageInSecondsBykeyES.saveAsNewAPIHadoopFile(
@@ -162,7 +182,7 @@ index_data(documents, 'syslog_analysis_pyspark', 'total_usage')
 # extracting Month and date as key and calculated time as value
 sessionUsageInSecondsDayByMap = sessionUsageInSecondsBykey.map(
     lambda oacsudbym: (oacsudbym[0].split(" ")[0] + " " + oacsudbym[0].split(" ")[1], oacsudbym[1]))
-# aggigating useage time by date and count by date
+# aggregating usage time by date and count by date
 sessionUsageTotalInSecondsByDay = sessionUsageInSecondsDayByMap.aggregateByKey((0.0, 0), (
     lambda totalTimeAndCount, element:
     (totalTimeAndCount[0] + element, totalTimeAndCount[1] + 1)), (lambda finalTotalTimeAndCount,
